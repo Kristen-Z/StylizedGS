@@ -60,7 +60,7 @@ def load_and_preprocess_style_image(style_path, target_size, output_dir=None, de
         save_path = os.path.join(output_dir, "style_image.jpg")
         imageio.imwrite(save_path, np.clip(style_img * 255.0, 0, 255).astype(np.uint8))
 
-    style_tensor = torch.from_numpy(style_img).permute(2, 0, 1).unsqueeze(0).to(device)
+    style_tensor = torch.from_numpy(style_img).to(device)
 
     print("[INFO] Style image loaded: {}, processed size: {}".format(style_path, style_tensor.shape))
     return style_tensor

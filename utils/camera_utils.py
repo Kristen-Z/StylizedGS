@@ -72,7 +72,10 @@ def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_syntheti
     for id, c in enumerate(cam_infos):
         camera_list.append(loadCam(args, id, c, resolution_scale, is_nerf_synthetic, is_test_dataset))
 
-    return camera_list
+    if camera_list:
+        return camera_list, camera_list[-1].image_width, camera_list[-1].image_height
+    else:
+        return camera_list, 0, 0
 
 def camera_to_JSON(id, camera : Camera):
     Rt = np.zeros((4, 4))

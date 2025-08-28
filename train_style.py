@@ -86,7 +86,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
 
-    viewpoint_stack = scene.getTrainCameras().copy()
+    viewpoint_stack = None
     ema_loss_for_log = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
@@ -183,10 +183,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             w_variance = torch.mean(torch.pow(image[:, :, :, :-1] - image[:, :, :, 1:], 2))
             h_variance = torch.mean(torch.pow(image[:, :, :-1, :] - image[:, :, 1:, :], 2))
 
-            loss_dict['nnfm_loss' if not args.preserve_color else 'lum_nnfm_loss'] *= 5000
+            loss_dict['nnfm_loss' if not args.preserve_color else 'lum_nnfm_loss'] *= args.style_weight
             loss_dict["content_loss"] *= args.content_weight
             loss_dict["img_tv_loss"] = args.img_tv_weight * (h_variance + w_variance) / 2.0
-            loss_dict['depth_loss'] = l2_loss(depth_image, depth_gt) * 500
+            loss_dict['depth_loss'] = l2_loss(depth_image, depth_gt)
             
         else: 
             set_geometry_grad(gaussians,True)
@@ -199,8 +199,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss_dict['ddsm_loss'] = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
         # opacity & scale regulariers
-        loss_dict['opacity_regu'] = l1_loss(gaussians._opacity, original_opacity) * 50
-        loss_dict['scale_regu'] = l1_loss(gaussians._scaling, original_scale) * 50
+        loss_dict['opacity_regu'] = l1_loss(gaussians._opacity, original_opacity)
+        loss_dict['scale_regu'] = l1_loss(gaussians._scaling, original_scale)
 
         loss = sum(list(loss_dict.values()))
 
@@ -219,7 +219,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -275,54 +274,12 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
-    if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
-        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
-        tb_writer.add_scalar('iter_time', elapsed, iteration)
-
-    # Report test and samples of training set
-    if iteration in testing_iterations:
-        torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
-
-        for config in validation_configs:
-            if config['cameras'] and len(config['cameras']) > 0:
-                l1_test = 0.0
-                psnr_test = 0.0
-                for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    if train_test_exp:
-                        image = image[..., image.shape[-1] // 2:]
-                        gt_image = gt_image[..., gt_image.shape[-1] // 2:]
-                    if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
-                if tb_writer:
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
-
-        if tb_writer:
-            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
-        torch.cuda.empty_cache()
-
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
     op = StyleOptimizationParams(parser)
     pp = PipelineParams(parser)
-    parser.add_argument('--ip', type=str, default="127.0.0.1")
-    parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
@@ -336,8 +293,10 @@ if __name__ == "__main__":
     parser.add_argument("--point_cloud", type=str, help='trained real 3DGS ply', default = None)
     parser.add_argument("--style", type=str, help="path to style image")
     parser.add_argument("--second_style", type=str, default="", help="path to second style image")
-    parser.add_argument("--content_weight", type=float, default=5, help="content loss weight")
-    parser.add_argument("--img_tv_weight", type=float, default=100, help="image tv loss weight")
+    parser.add_argument("--histgram_match", action="store_true", default=True)
+    parser.add_argument("--style_weight", type=float, default=5, help="style loss weight")
+    parser.add_argument("--content_weight", type=float, default=5e-3, help="content loss weight")
+    parser.add_argument("--img_tv_weight", type=float, default=1, help="image tv loss weight")
     parser.add_argument(
         "--vgg_block",
         type=list,

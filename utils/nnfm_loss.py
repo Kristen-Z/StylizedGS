@@ -1,7 +1,6 @@
 import torch
 import torchvision
 from torchvision.models import vgg16, VGG16_Weights
-from icecream import ic
 import torch.nn.functional as F
 from typing import Tuple
 
@@ -143,14 +142,11 @@ def color_histgram_match(
         )
 
     # Multiply input vector by new cov matrix
-    # print('new_vec', new_cov.shape)
     new_vec = input_vec @ new_cov[0].T
 
     # Reshape output vector back to input's shape &
     # add the source mean to our output vector
     image_set = (new_vec.reshape(sh) + source_mean).clamp_(0.0, 1.0)
-
-    # print('new cov', new_cov.shape, 'source_mean', source_mean.shape)
     
     color_tf = torch.eye(4).float().to(new_cov.device)
     color_tf[:3, :3] = new_cov
@@ -259,25 +255,19 @@ def content_loss(feat_result, feat_content):
     return d
 
 def crop_nonzero_region(image, padding=5):
-    # 找到非零元素的坐标
     nonzero_indices = torch.nonzero(image != 0)
 
     row, col = image.shape[-2:]
     if len(nonzero_indices) == 0:
-        # 如果图像中没有非零元素，返回空张量或其他适当的处理
         return torch.tensor([])
-
-    # 计算最小包围矩形的坐标范围
+    
     min_row = torch.min(nonzero_indices[:, 2])
     max_row = torch.max(nonzero_indices[:, 2])
     min_col = torch.min(nonzero_indices[:, 3])
     max_col = torch.max(nonzero_indices[:, 3])
 
-
-    # 切片原始图像以获得矩形区域
     cropped_image = image[:, :, max(0, min_row-padding):min(row, max_row + 1+padding), max(0, min_col-padding):min(col, max_col + 1+padding)]
 
-    # print('cropped feat', cropped_image.shape)
     return cropped_image
 
 
@@ -365,7 +355,6 @@ class NNFMLoss(torch.nn.Module):
             layers = block_indexes[block]
             x_feats = torch.cat([x_feats_all[ix_map[ix]] for ix in layers], 1)
             s_feats = torch.cat([s_feats_all[ix_map[ix]] for ix in layers], 1)
-            # print('x_feat', x_feats.shape, 's_feat', s_feats.shape) # x_feat torch.Size([1, 768, 299, 400]) s_feat torch.Size([1, 768, 291, 400])
 
             if 'lum_nnfm_loss' in loss_names:
                 x_feats = torch.cat([lum_x_feats[ix_map[ix]] for ix in layers], 1)
@@ -378,20 +367,15 @@ class NNFMLoss(torch.nn.Module):
                 loss_dict["nnfm_loss"] += cos_loss(x_feats, target_feats)
 
             if "gram_loss" in loss_names:
-                # loss_dict["gram_loss"] += torch.mean((gram_matrix(x_feats) - gram_matrix(s_feats)) ** 2)
                 loss_dict["gram_loss"] += F.mse_loss(gram_matrix(x_feats), gram_matrix(s_feats))
 
             if "content_loss" in loss_names:
                 content_feats = torch.cat([content_feats_all[ix_map[ix]] for ix in layers], 1)
-                # loss_dict["content_loss"] += torch.mean((content_feats - x_feats) ** 2)
                 loss_dict["content_loss"] += F.mse_loss(x_feats, content_feats)
-                # loss_dict["content_loss"] += content_loss(x_feats, content_feats)
 
             if "spatial_loss" in loss_names:
                 x_mask_feats = torch.cat([x_feats_mask[ix_map[ix]] for ix in layers], 1)
                 s_mask_feats = torch.cat([s_feats_mask[ix_map[ix]] for ix in layers], 1)
-                # print('x_feat mask', x_mask_feats.shape, 's_feat mask', s_mask_feats.shape) # x_feat mask torch.Size([1, 768, 299, 400]) s_feat mask torch.Size([1, 768, 291, 400])
-                # loss_dict['spatial_loss'] += F.mse_loss(gram_matrix(x_mask_feats), gram_matrix(s_mask_feats))
                 loss_dict['spatial_loss'] += cos_loss(x_mask_feats, nn_feat_replace(x_mask_feats, s_mask_feats))
 
         if "scale_loss" in loss_names:
@@ -453,19 +437,3 @@ Params size (MB): 56.13
 Estimated Total Size (MB): 275.10
 ----------------------------------------------------------------
 """
-
-
-if __name__ == '__main__':
-    device = torch.device('cuda:0')
-    nnfm_loss_fn = NNFMLoss(device)
-    fake_output = torch.rand(1, 3, 256, 256).to(device)
-    fake_style = torch.rand(1, 3, 256, 256).to(device)
-    fake_content = torch.rand(1, 3, 256, 256).to(device)
-
-    loss = nnfm_loss_fn(outputs=fake_output, styles=fake_style, contents=fake_content, loss_names=["nnfm_loss", "content_loss", "gram_loss"])
-    ic(loss)
-
-    fake_image_set = torch.rand(10, 256, 256, 3).to(device)
-    fake_style = torch.rand(256, 256, 3).to(device)
-    fake_image_set_new, color_tf = match_colors_for_image_set(fake_image_set, fake_style)
-    ic(fake_image_set_new.shape, color_tf.shape)

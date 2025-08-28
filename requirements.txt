@@ -1,6 +1,7 @@
 tqdm
-icecream
 lpips
 opencv-python
 joblib
 gdown
+imageio
+plyfile
