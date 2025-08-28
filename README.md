@@ -10,7 +10,7 @@
     ·
     <a href="http://people.geometrylearning.com/yyj/">Yu-Jie Yuan</a>
     · 
-    <a herf="https://seancomeon.github.io/">Zhuoxun Chen</a>
+    <a href="https://seancomeon.github.io/">Zhuoxun Chen</a>
     ·
     <a href="https://people.wgtn.ac.nz/fanglue.zhang">Fang-Lue Zhang</a>
     ·
