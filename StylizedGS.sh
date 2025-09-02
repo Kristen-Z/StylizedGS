@@ -17,8 +17,11 @@ python train_style.py -s ${data_dir} \
                 -m ${ckpt_stylegs} \
                 --point_cloud ${ckpt_gs}/point_cloud/iteration_30000/point_cloud.ply \
                 --style ${style_img} \
-                --histgram_match \
-                # --preserve_color
+                # --mask_dir ${data_dir}/masks \
+                # --second_style datasets/styles/12.jpg \
+                # --scale_level 0 \
+                # --preserve_color \
+                
 
 python render.py -m ${ckpt_stylegs} \
                         --point_cloud ${ckpt_stylegs}/point_cloud/iteration_31500/point_cloud.ply \

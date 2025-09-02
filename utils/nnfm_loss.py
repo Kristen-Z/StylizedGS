@@ -277,6 +277,11 @@ class NNFMLoss(torch.nn.Module):
 
         self.vgg = vgg16(weights=VGG16_Weights.DEFAULT).eval().to(device)
         self.normalize = torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        self.scale_coefs=[
+                    [0,0,0,5,3,0], #0
+                    [0,0,5,3,0,0], #1
+                    [8,0,0,0,0,0], #2
+                ]
 
     def get_feats(self, x, layers=[]):
         x = self.normalize(x)
@@ -302,10 +307,11 @@ class NNFMLoss(torch.nn.Module):
         ],
         loss_names=["nnfm_loss"],  # can also include 'gram_loss', 'content_loss'
         contents=None,
-        layer_coef=[1.0,1.0],
+        scale_level=None,
         x_mask=None,
         s_mask=None,
         styles2=None,
+        spatial_weight=20,
     ):
         for x in loss_names:
             assert x in ['nnfm_loss', 'content_loss', 'gram_loss', 'lum_nnfm_loss', "spatial_loss", "scale_loss"]
@@ -362,7 +368,7 @@ class NNFMLoss(torch.nn.Module):
                 target_feats = nn_feat_replace(x_feats, s_feats)
                 loss_dict["lum_nnfm_loss"] += cos_loss(x_feats, target_feats)
 
-            if "nnfm_loss" in loss_names:
+            if "nnfm_loss" in loss_names and scale_level is None:
                 target_feats = nn_feat_replace(x_feats, s_feats)
                 loss_dict["nnfm_loss"] += cos_loss(x_feats, target_feats)
 
@@ -376,9 +382,10 @@ class NNFMLoss(torch.nn.Module):
             if "spatial_loss" in loss_names:
                 x_mask_feats = torch.cat([x_feats_mask[ix_map[ix]] for ix in layers], 1)
                 s_mask_feats = torch.cat([s_feats_mask[ix_map[ix]] for ix in layers], 1)
-                loss_dict['spatial_loss'] += cos_loss(x_mask_feats, nn_feat_replace(x_mask_feats, s_mask_feats))
+                loss_dict['spatial_loss'] += cos_loss(x_mask_feats, nn_feat_replace(x_mask_feats, s_mask_feats)) * spatial_weight
 
-        if "scale_loss" in loss_names:
+        if scale_level is not None:
+            layer_coef = self.scale_coefs[scale_level]
             for layerindex in all_layers:
                 x_feats = x_feats_all[ix_map[layerindex]]
                 s_feats = s_feats_all[ix_map[layerindex]]

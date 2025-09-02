@@ -27,6 +27,8 @@ from utils.nnfm_loss import NNFMLoss, match_colors_for_image_set, color_histgram
 from utils.image_utils import load_and_preprocess_style_image
 import imageio.v2 as imageio
 import numpy as np
+from scipy.ndimage import gaussian_filter
+import cv2
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -97,7 +99,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # choose other hues:
     if args.second_style:
         style_img2 = imageio.imread(args.second_style, pilmode="RGB").astype(np.float32) / 255.0
+        style_img2 = cv2.resize(style_img2, (style_img.shape[1],style_img.shape[0]), interpolation=cv2.INTER_AREA)
         style_img2 = torch.from_numpy(style_img2).cuda()
+
+    # prepare depth image
+    depth_img_list = []
+    # mask for spatial control
+    mask_img_list = []
+    mask_half_list = []
+    with torch.no_grad():
+        for i, view in enumerate(tqdm(scene.getTrainCameras(), desc="Rendering original depth")):
+            depth_render = render(view, gaussians, pipe, background)["depth"]
+            depth_img_list.append(depth_render)
+
+            if args.mask_dir:
+                select_mask = np.load(os.path.join(args.mask_dir, f'{view.image_name[:-4]}.npy'))
+                select_mask = gaussian_filter(select_mask, sigma=1)
+                
+                mask_img_list.append(torch.from_numpy(cv2.resize(select_mask.astype(np.uint8), (scene.img_width, scene.img_height),interpolation=cv2.INTER_AREA)))
+                mask_half_list.append(torch.from_numpy(cv2.resize(select_mask.astype(np.uint8), (scene.img_width//2, scene.img_height//2),interpolation=cv2.INTER_AREA)))
     # precolor step
     if not args.preserve_color:
         gt_img_list = []
@@ -105,23 +125,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gt_img_list.append(view.original_image.permute(1,2,0))
         gt_imgs = torch.stack(gt_img_list)
 
-        if args.histgram_match:
+        if not args.mask_dir:
             gt_imgs, color_ct = color_histgram_match(gt_imgs, style_img if not args.second_style else style_img2) #.repeat(gt_imgs.shape[0],1,1,1))
+            gaussians.apply_ct(color_ct.detach().cpu().numpy())
         else:
-            gt_imgs, color_ct = match_colors_for_image_set(gt_imgs, style_img if not args.second_style else style_img2)
-        gaussians.apply_ct(color_ct.detach().cpu().numpy())
+            mask_imgs = torch.stack(mask_img_list).unsqueeze(-1).repeat(1,1,1,3).cuda()
+            if args.second_style:
+                gt_imgs1, color_ct = color_histgram_match(gt_imgs, style_img)
+                gt_imgs2, color_ct2 = color_histgram_match(gt_imgs, style_img2)
+                gt_imgs = gt_imgs1 * (1-mask_imgs) + gt_imgs2 * mask_imgs
+            else:
+                recolor_gt_imgs, color_ct = color_histgram_match(gt_imgs, style_img)
+                gt_imgs = recolor_gt_imgs * mask_imgs + gt_imgs * (1-mask_imgs)
+
+
         gt_img_list = [item.permute(2,0,1) for item in gt_imgs]
         imageio.imwrite(
             os.path.join(args.model_path, "gt_image_recolor.png"),
             np.clip(gt_img_list[0].permute(1,2,0).detach().cpu().numpy() * 255.0, 0.0, 255.0).astype(np.uint8),
         )
-
-    # prepare depth image
-    depth_img_list = []
-    with torch.no_grad():
-        for view in tqdm(scene.getTrainCameras(), desc="Rendering progress"):
-            depth_render = render(view, gaussians, pipe, background)["depth"]
-            depth_img_list.append(depth_render)
 
     for iteration in range(first_iter, opt.iterations + 1):
         iter_start.record()
@@ -131,9 +153,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
+            depth_stack = depth_img_list.copy()
             if not args.preserve_color:
                 gt_stack = gt_img_list.copy()
-            depth_stack = depth_img_list.copy()
+            if args.mask_dir:
+                mask_stack = mask_half_list.copy()
         view_idx = randint(0, len(viewpoint_stack)-1)
         viewpoint_cam = viewpoint_stack.pop(view_idx)
 
@@ -156,9 +180,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             gt_image = viewpoint_cam.original_image.cuda()
         depth_gt = depth_stack.pop(view_idx)
+        mask_image = None
 
         gt_image = gt_image.unsqueeze(0)
         image = image.unsqueeze(0)
+
+        if args.mask_dir:
+            loss_type = ['spatial_loss','content_loss'] if not args.second_style else ['spatial_loss','nnfm_loss','content_loss']
+            mask_image = mask_stack.pop(view_idx).cuda()
+        elif args.preserve_color or (args.second_style and not args.mask_dir):
+            loss_type = ['lum_nnfm_loss','content_loss']
+        elif args.scale_level is not None:
+            loss_type = ["scale_loss", "content_loss"]
+        else:
+            loss_type = ['nnfm_loss','content_loss']
+
 
         if iteration > first_iter + 200: # stylization
             set_geometry_grad(gaussians,False) # True -> Turn off the geo change
@@ -171,19 +207,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 ),
                 style_img.permute(2,0,1).unsqueeze(0),
                 blocks=args.vgg_block,
-                loss_names=["nnfm_loss", "content_loss"] if not args.preserve_color else ['lum_nnfm_loss','content_loss'],
+                loss_names=loss_type,
                 contents=F.interpolate(
                     gt_image,
                     size=None,
                     scale_factor=0.5,
                     mode="bilinear",
                 ),
+                scale_level=args.scale_level,
+                x_mask=mask_image,
+                styles2=style_img2.permute(2,0,1).unsqueeze(0) if args.second_style else None,
             )
             image.requires_grad_(True)
             w_variance = torch.mean(torch.pow(image[:, :, :, :-1] - image[:, :, :, 1:], 2))
             h_variance = torch.mean(torch.pow(image[:, :, :-1, :] - image[:, :, 1:, :], 2))
 
-            loss_dict['nnfm_loss' if not args.preserve_color else 'lum_nnfm_loss'] *= args.style_weight
+            loss_dict[loss_type[0]] *= args.style_weight
             loss_dict["content_loss"] *= args.content_weight
             loss_dict["img_tv_loss"] = args.img_tv_weight * (h_variance + w_variance) / 2.0
             loss_dict['depth_loss'] = l2_loss(depth_image, depth_gt)
@@ -293,7 +332,6 @@ if __name__ == "__main__":
     parser.add_argument("--point_cloud", type=str, help='trained real 3DGS ply', default = None)
     parser.add_argument("--style", type=str, help="path to style image")
     parser.add_argument("--second_style", type=str, default="", help="path to second style image")
-    parser.add_argument("--histgram_match", action="store_true", default=True)
     parser.add_argument("--style_weight", type=float, default=5, help="style loss weight")
     parser.add_argument("--content_weight", type=float, default=5e-3, help="content loss weight")
     parser.add_argument("--img_tv_weight", type=float, default=1, help="image tv loss weight")
@@ -310,7 +348,9 @@ if __name__ == "__main__":
         help="whether to reset the number of spherical harmonics basis to this specified number",
     )
     parser.add_argument("--preserve_color", action="store_true", default=False)
-   
+    parser.add_argument("--scale_level", type=int, default=None, choices=[0,1,2], help='the scale of style pattern, can be [0,1,2]')
+    parser.add_argument("--mask_dir", default=None, type=str, help="The directory of multiview masks")
+
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
